@@ -1,5 +1,7 @@
 .env
 output/
+!output/.gitignore
 __pycache__
 venv
 pdf_docs/
+!pdf_docs/.gitignore
