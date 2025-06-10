@@ -49,7 +49,7 @@ def convert_pdf_to_images(pdf_path, output_folder, dpi=300):
 
     return image_paths
 
-def batch_images(image_paths, batch_size=25):
+def batch_images(image_paths, batch_size=100):
     """
     Yields successive n-sized chunks from a list of image paths.
     """
@@ -130,12 +130,20 @@ def ocr_with_gemini(image_paths, instruction_prefix=""):
                     print(f"      - {rating.category.name}: {rating.probability.name}")
             if first_candidate.content:
                 print(f"    Content Parts (text): {len([p for p in first_candidate.content.parts if p.text])}")
-                text_part_snippet = next((p.text for p in first_candidate.content.parts if p.text), "")
-                print(f"    Text Snippet (first 200 chars): {text_part_snippet[:200] if text_part_snippet else 'No text part found'}")
+                print(f"    Content Parts (text): {len([p for p in first_candidate.content.parts if p.text])}")
             else:
                 print("    No content in first candidate.")
         else:
             print("    No candidates returned in response.")
+        # --- DEBUGGING END ---
+
+        # --- DEBUGGING START ---
+        if response.usage_metadata:
+            print(f"  [OCR_DEBUG] Token counts: Input={response.usage_metadata.prompt_token_count}, Output={response.usage_metadata.candidates_token_count}, Total={response.usage_metadata.total_token_count}")
+        
+        if response.candidates and first_candidate.finish_reason.name == 'MAX_OUTPUT_TOKENS':
+            print(f"  [OCR_DEBUG] WARNING: Output truncated due to MAX_OUTPUT_TOKENS limit for this batch.")
+            print(f"  [OCR_DEBUG] Consider reducing batch size or simplifying prompt if this is a recurring issue.")
         # --- DEBUGGING END ---
 
         return response.text
@@ -194,41 +202,18 @@ def process_large_pdf(pdf_path, temp_images_folder):
     print(f"  [PDF_DEBUG] Temporary images saved to: {temp_images_folder}. Manual inspection is recommended.")
     # --- DEBUGGING END ---
 
-    image_batches = list(batch_images(image_paths, 25))
+    image_batches = list(batch_images(image_paths, 10)) # Using a smaller batch size (e.g., 10) to mitigate output token limits
 
     full_extracted_text = ""
 
     for i, batch in enumerate(image_batches):
-        print(f"Processing batch {i + 1} of {len(image_batches)} for '{os.path.basename(pdf_path)}' (Pages {i*25 + 1} to {min((i+1)*25, len(image_paths))})...")
+        print(f"Processing batch {i + 1} of {len(image_batches)} for '{os.path.basename(pdf_path)}' (Pages {i*10 + 1} to {min((i+1)*10, len(image_paths))})...")
         batch_text = ocr_complex_document(batch)
         full_extracted_text += f"\n\n--- END OF BATCH {i + 1} ---\n\n{batch_text}"
 
     print(f"Cleaning up temporary images for '{os.path.basename(pdf_path)}'...")
-    # Remember to uncomment this block once debugging is complete!
     if os.path.exists(temp_images_folder):
         shutil.rmtree(temp_images_folder)
         print(f"Removed temporary image folder: {temp_images_folder}")
 
     return full_extracted_text
-
-def harmonize_document(extracted_text):
-    prompt = f"""
-    **Task: Document Harmonization for RAG System - Absolute Fidelity Required**
-
-    The following text was extracted from a single large document in multiple batches. The batches are separated by '--- END OF BATCH ---' markers.
-
-    Your task is to merge this content into a single, seamless, and absolutely coherent document. **The highest priority is to retain EVERY piece of information and maintain the precise original structure, flow, and formatting from the source document.** This output will be used directly for RAG chunking, so any alteration, omission, or addition is highly detrimental.
-
-    **Instructions (Adhere Strictly):**
-    1.  **Remove ALL batch separation markers.**
-    2.  **Fix formatting breaks and stitch content seamlessly**:
-        * Ensure paragraphs, headings, and lists flow naturally across batch boundaries.
-        * Correct any unintended line breaks, extra spaces, or missing spaces introduced by the OCR or batching.
-    3.  **Stitch broken tables**: If a Markdown table was split across a batch boundary, **merge it back into a single, perfectly formatted Markdown table**. Verify that all column headers and row data are correctly aligned and complete.
-    4.  **Preserve all original formatting elements**: Maintain bolding, italics (where clear from context or markdown), and other structural cues that aid readability and context for RAG.
-    5.  **DO NOT summarize, paraphrase, interpret, add comments, or generate new information.** Your function is purely to assemble the transcribed text into a single, correct, and continuous representation of the original document.
-    6.  **The output MUST be the complete, raw, merged text content, nothing more.**
-    """
-    content = [prompt, extracted_text]
-    response = model.generate_content(content)
-    return response.text

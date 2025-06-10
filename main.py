@@ -1,9 +1,10 @@
 import os
 import tempfile # For creating temporary directories
 from ocr_utils import (
-    process_large_pdf,
-    harmonize_document
+    process_large_pdf
 )
+import tempfile # For creating temporary directories
+import os
 
 def main():
     # Define your input and output directories
@@ -42,18 +43,13 @@ def main():
             with tempfile.TemporaryDirectory() as temp_images_dir:
                 print(f"Using temporary image directory: {temp_images_dir}")
 
-                # Step 1: Process the PDF (converts to images, OCRs in batches, cleans images)
-                # The process_large_pdf function handles its own image cleanup now.
-                raw_extracted_text = process_large_pdf(pdf_path, temp_images_dir)
+                # Step 1: Process the PDF (converts to images, OCRs in a single call, cleans images)
+                extracted_text = process_large_pdf(pdf_path, temp_images_dir)
 
-                # Step 2: Harmonize the extracted text
-                print(f"Harmonizing the extracted text for '{pdf_name}'...")
-                harmonized_text = harmonize_document(raw_extracted_text)
-
-                # Step 3: Save the final harmonized text to the flat output folder
+                # Step 2: Save the final extracted text to the flat output folder
                 with open(final_output_path, 'w', encoding='utf-8') as f:
-                    f.write(harmonized_text)
-                print(f"SUCCESS: Final harmonized text saved to: {final_output_path}")
+                    f.write(extracted_text)
+                print(f"SUCCESS: Final extracted text saved to: {final_output_path}")
 
         except ValueError as e:
             print(f"SKIPPED: OCR failed for '{pdf_name}' due to content restriction or invalid response: {e}")
@@ -65,7 +61,7 @@ def main():
             print(f"ERROR: An unexpected error occurred while processing '{pdf_name}': {e}")
             print(f"No output file generated for this document due to an unexpected error.")
 
-    print("\n--- All PDF OCR and harmonization attempts completed. ---")
+    print("\n--- All PDF OCR attempts completed. ---")
     print(f"Check the '{final_output_folder}' directory for successfully processed text files.")
 
 if __name__ == "__main__":
