@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 from pdf2image import convert_from_path
 from PIL import Image
 import shutil # Import shutil for removing directories
+import json # Import json for pretty printing
+import io # Import io for in-memory byte streams
 
 # Load the API key from the .env file
 load_dotenv()
@@ -12,12 +14,12 @@ api_key = os.getenv('GOOGLE_API_KEY')
 # Configure the Gemini API with your key
 genai.configure(api_key=api_key)
 
-# Initialize the Gemini 2.0 Flash model
-model = genai.GenerativeModel('gemini-2.0-flash')
+# Initialize the Gemini 1.5 Flash model
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 def convert_pdf_to_images(pdf_path, output_folder, dpi=300):
     """
-    Converts each page of a PDF file into a high-resolution image.
+    Converts each page of a PDF file into a high-resolution image, saving directly as JPEG.
 
     Args:
         pdf_path (str): The file path of the PDF.
@@ -30,14 +32,20 @@ def convert_pdf_to_images(pdf_path, output_folder, dpi=300):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    # This function does the conversion
-    images = convert_from_path(pdf_path, dpi=dpi)
+    # --- REVISED IMAGE CONVERSION START ---
+    # Directly instruct convert_from_path to save as JPEG and return paths
+    # This is the most reliable way to ensure the desired format.
+    image_paths = convert_from_path(
+        pdf_path,
+        dpi=dpi,
+        output_folder=output_folder, # Tell it where to save the files
+        fmt='jpeg',                  # Tell it to save as JPEG
+        paths_only=True              # Tell it to return the paths it saved
+    )
+    # --- REVISED IMAGE CONVERSION END ---
 
-    image_paths = []
-    for i, image in enumerate(images):
-        image_path = os.path.join(output_folder, f'page_{i + 1}.jpg')
-        image.save(image_path, 'JPEG')
-        image_paths.append(image_path)
+    # Add a debug print to confirm the generated paths are JPEGs
+    print(f"  [PDF_DEBUG] pdf2image generated paths (first 5): {[os.path.basename(p) for p in image_paths[:5]]}")
 
     return image_paths
 
@@ -48,154 +56,155 @@ def batch_images(image_paths, batch_size=25):
     for i in range(0, len(image_paths), batch_size):
         yield image_paths[i:i + batch_size]
 
-def ocr_with_gemini(image_paths, instruction):
+def ocr_with_gemini(image_paths, instruction_prefix=""):
     """
-    Performs OCR on a list of images using Gemini 2.0 Flash.
+    Performs OCR on a list of images using Gemini 1.5 Flash.
 
     Args:
         image_paths (list): A list of file paths for the images to process.
-        instruction (str): The prompt/instruction for the model.
+        instruction_prefix (str): An optional prefix for specific instructions.
 
     Returns:
         str: The extracted text from the images.
     """
-    images = [Image.open(path) for path in image_paths]
+    images_for_gemini = []
+    for path in image_paths:
+        # --- DEBUGGING START ---
+        print(f"  [OCR_DEBUG] Attempting to open path for Gemini API: {path}")
+        if not os.path.exists(path):
+            print(f"  [OCR_DEBUG] WARNING: Image file does not exist at path: {path}. Skipping.")
+            continue
+        if not path.lower().endswith(('.jpg', '.jpeg', '.png')): # Also check for PNG just in case
+            print(f"  [OCR_DEBUG] WARNING: Unexpected image extension '{os.path.splitext(path)[1]}' for path: {path}. Expected .jpg/.png.")
+        # --- DEBUGGING END ---
 
-    # --- REVISED PROMPT START ---
+        try:
+            img = Image.open(path)
+            # Ensure image is in RGB mode, as some APIs prefer it
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            images_for_gemini.append(img)
+        except Exception as img_err:
+            print(f"  [OCR_DEBUG] ERROR: Could not open/process image '{path}': {img_err}. Skipping this image.")
+            # We don't raise here, we just skip the problematic image in the batch
+            # If all images in a batch fail, images_for_gemini will be empty and handled below.
+            continue
+
+
+    # --- DEBUGGING START ---
+    print(f"  [OCR_DEBUG] Processing batch with {len(images_for_gemini)} images (after loading/conversion).")
+    if not images_for_gemini:
+        print("  [OCR_DEBUG] WARNING: No valid images to send to Gemini in this batch! Returning empty string.")
+        return ""
+    # --- DEBUGGING END ---
+
     prompt = f"""
-    {instruction}
+    {instruction_prefix}
 
-    You are an **extremely meticulous and literal OCR engine**. Your sole purpose is to **transcribe every single visible character and piece of text** from the provided document pages. This output is for a RAG (Retrieval Augmented Generation) system, so **completeness and absolute fidelity to the source content are paramount**.
-
-    **Strict Adherence Guidelines (Do NOT deviate):**
-    1.  **NO SUMMARIZATION, NO INTERPRETATION, NO ADDITIONS, NO DELETIONS, NO MODIFICATIONS.**
-    2.  **Transcribe EXACTLY what you see.** Every word, every number, every symbol, every punctuation mark.
-    3.  **Preserve Original Structure:**
-        * **Paragraphs:** Maintain original paragraph breaks.
-        * **Headings/Subheadings:** Include all headings and subheadings as they appear.
-        * **Lists:** Replicate bullet points, numbered lists, and other list formats precisely.
-        * **Indentation:** Preserve indentation where it conveys structural meaning (e.g., in outlines or code snippets, though less common in reports).
-    4.  **Tables:** Convert tables into **perfectly formatted Markdown tables**.
-        * Every column header and row data point must be correctly aligned.
-        * Transcribe all numerical and text data within tables with **100% accuracy, including decimals and currency symbols.**
-    5.  **Multi-Column Layouts:** Process text in multi-column layouts **strictly sequentially from left-to-right, then top-to-bottom**. Do not intermix text from different columns on the same line. Use newlines to separate logical blocks.
-    6.  **Charts, Graphs, Images (Text Extraction):** Extract all **legible text** from these elements: titles, captions, axis labels, legends, data labels, and any other embedded text. Do not describe the image itself, only extract its text content.
-    7.  **Headers, Footers, Page Numbers, Footnotes:** Include these as they appear. They are part of the document's content.
-    8.  **Whitespace:** Preserve significant whitespace that impacts structure (e.g., line breaks, spacing between paragraphs). Avoid excessive or unnecessary newlines.
-    9.  **No Commentary:** Do not generate any conversational text, introductory phrases ("Here is the extracted text:"), or concluding remarks. Just the raw, transcribed document content.
-
-    **Focus on capturing the entirety of the document's textual information for precise retrieval.**
+    Extract ALL text content from the following document pages.
+    Transcribe every single visible character, word, number, and symbol.
+    Preserve the original document structure:
+    -   Maintain paragraph breaks and line breaks.
+    -   Keep headings, subheadings, and lists as they appear.
+    -   Convert tables into Markdown format, ensuring correct alignment.
+    -   Process multi-column layouts from left-to-right, top-to-bottom.
+    -   Extract any legible text from charts, graphs, or images (titles, labels, legends).
+    -   Include headers, footers, and page numbers.
+    -   DO NOT add any comments, summaries, or extraneous text.
+    -   The output should be the complete and exact text content of the document.
     """
-    # --- REVISED PROMPT END ---
 
-    # Prepare the content for the API call
-    content = [prompt, *images]
+    content = [prompt, *images_for_gemini] # Use the prepared images_for_gemini list
 
-    response = model.generate_content(content)
-    return response.text
+    try:
+        response = model.generate_content(content)
 
-# Retaining specialized OCR functions, though main.py will use the general one with a specific instruction
+        # --- DEBUGGING START ---
+        print(f"  [OCR_DEBUG] Raw response object (first candidate):")
+        if response.candidates:
+            first_candidate = response.candidates[0]
+            print(f"    Finish Reason: {first_candidate.finish_reason.name if first_candidate.finish_reason else 'N/A'}")
+            if first_candidate.safety_ratings:
+                print("    Safety Ratings:")
+                for rating in first_candidate.safety_ratings:
+                    print(f"      - {rating.category.name}: {rating.probability.name}")
+            if first_candidate.content:
+                print(f"    Content Parts (text): {len([p for p in first_candidate.content.parts if p.text])}")
+                text_part_snippet = next((p.text for p in first_candidate.content.parts if p.text), "")
+                print(f"    Text Snippet (first 200 chars): {text_part_snippet[:200] if text_part_snippet else 'No text part found'}")
+            else:
+                print("    No content in first candidate.")
+        else:
+            print("    No candidates returned in response.")
+        # --- DEBUGGING END ---
+
+        return response.text
+    except ValueError as e:
+        print(f"  [OCR_DEBUG] ERROR: ValueError when trying to get response.text in ocr_with_gemini. Error: {e}")
+        raise e
+    except Exception as e:
+        print(f"  [OCR_DEBUG] UNEXPECTED ERROR: An unexpected error occurred during model generation: {e}")
+        raise e
+
+# Rest of ocr_utils.py remains the same:
 def ocr_complex_document(image_paths):
+    instruction_prefix = """
+    **Special emphasis for complex layouts:**
+    -   Ensure accurate Markdown table recreation.
+    -   Strictly maintain multi-column reading order (left-to-right, top-to-bottom).
+    -   Extract all text from charts and graphs.
     """
-    Uses a specialized prompt for OCR on documents with complex layouts.
-    This function will be called by process_large_pdf with an explicit instruction.
-    """
-    # The instruction here is now more specific, but the main detail is in ocr_with_gemini's base prompt
-    instruction = """
-    **Task: High-Fidelity Text Extraction for Complex Layouts (RAG Optimization)**
-
-    Focus on capturing all textual information while faithfully representing the original document's structure for optimal RAG chunking.
-    """
-    return ocr_with_gemini(image_paths, instruction)
+    return ocr_with_gemini(image_paths, instruction_prefix)
 
 def ocr_financial_document(image_paths):
+    instruction_prefix = """
+    **Special emphasis for financial documents:**
+    -   Achieve 100% numerical accuracy, including decimals and currency symbols.
+    -   Precisely transcribe financial tables into Markdown.
+    -   Capture all dates and critical sections like footnotes.
     """
-    Uses a highly specific prompt for extracting data from financial documents.
-    """
-    instruction = """
-    **Task: Financial Document OCR for RAG System**
-
-    Extract text from these financial reports with extreme precision, focusing on numerical and structured data, for a RAG system.
-
-    **Key Focus Areas (in addition to general strict guidelines):**
-    1.  **Numerical Accuracy**: All numbers, decimals, and percentages must be perfectly transcribed.
-    2.  **Currency Symbols**: Correctly associate symbols ($, €, £, etc.) with their corresponding values.
-    3.  **Financial Tables**: Replicate the exact structure of all tables (e.g., balance sheets, income statements) using Markdown.
-    4.  **Critical Sections**: Pay special attention to cash flow statements, footnotes, and disclosures.
-    5.  **Dates**: Accurately capture all financial period dates.
-    6.  **Maintain Context**: Ensure that numbers are clearly associated with their labels/descriptions.
-    """
-    return ocr_with_gemini(image_paths, instruction)
+    return ocr_with_gemini(image_paths, instruction_prefix)
 
 def verify_ocr_quality(image_path, extracted_text):
-    """
-    Uses Gemini to compare an image with its extracted text to find errors.
-    """
     image = Image.open(image_path)
-
     prompt = f"""
     **Task: OCR Quality Verification**
-
     You are a quality assurance analyst. I have an original document page image and the text extracted from it via OCR.
     Your job is to compare the image with the text and report any discrepancies.
-
     **Analyze for:**
     1.  **Missing Text**: Any words, sentences, or paragraphs missing from the text.
     2.  **Incorrect Characters**: Misrecognized letters, numbers, or symbols (e.g., 'l' vs '1', 'O' vs '0').
     3.  **Table Structure Errors**: Misaligned columns or rows in Markdown tables.
     4.  **Formatting Issues**: Lost paragraph breaks or incorrect list formatting.
-
     **Extracted Text to Verify:**
     ---
     {extracted_text}
     ---
-
     Provide a summary of any errors found. If no errors are found, respond with "No errors found."
     """
-
     response = model.generate_content([prompt, image])
     return response.text
 
 def process_large_pdf(pdf_path, temp_images_folder):
-    """
-    Processes a very large PDF by converting it to images, running OCR in batches,
-    and returns the combined raw text. Cleans up temporary images.
-
-    Args:
-        pdf_path (str): The file path of the PDF.
-        temp_images_folder (str): Temporary directory to save images.
-
-    Returns:
-        str: The full raw extracted text.
-    """
-    # Step 1: Convert the entire PDF to images
     print(f"Converting '{os.path.basename(pdf_path)}' to images...")
+    # This call now uses the fixed convert_pdf_to_images which will return JPEG paths
     image_paths = convert_pdf_to_images(pdf_path, temp_images_folder)
 
-    # Step 2: Create batches of images
-    image_batches = list(batch_images(image_paths, 25)) # Adjust batch size as needed
+    # --- DEBUGGING START ---
+    print(f"  [PDF_DEBUG] Temporary images saved to: {temp_images_folder}. Manual inspection is recommended.")
+    # --- DEBUGGING END ---
+
+    image_batches = list(batch_images(image_paths, 25))
 
     full_extracted_text = ""
-    # Store candidates and safety info for debugging
-    all_candidates_info = []
 
     for i, batch in enumerate(image_batches):
         print(f"Processing batch {i + 1} of {len(image_batches)} for '{os.path.basename(pdf_path)}' (Pages {i*25 + 1} to {min((i+1)*25, len(image_paths))})...")
-        try:
-            # We'll use the ocr_complex_document function here which calls ocr_with_gemini
-            # This ensures the new detailed prompt is always used.
-            batch_text = ocr_complex_document(batch)
-            full_extracted_text += f"\n\n--- END OF BATCH {i + 1} ---\n\n{batch_text}"
-        except Exception as e:
-            # Catching the exception here to provide more context about the problematic batch/pages
-            print(f"ERROR: Failed to OCR batch {i + 1} (Pages {i*25 + 1} to {min((i+1)*25, len(image_paths))}) for '{os.path.basename(pdf_path)}'.")
-            print(f"Error details: {e}")
-            # If the error is from response.text, it means no valid parts were returned.
-            # We need to re-raise this specific error as it's critical for content safety.
-            raise # Re-raise the exception to be caught by main.py
+        batch_text = ocr_complex_document(batch)
+        full_extracted_text += f"\n\n--- END OF BATCH {i + 1} ---\n\n{batch_text}"
 
-    # Step 3: Clean up temporary images
     print(f"Cleaning up temporary images for '{os.path.basename(pdf_path)}'...")
+    # Remember to uncomment this block once debugging is complete!
     if os.path.exists(temp_images_folder):
         shutil.rmtree(temp_images_folder)
         print(f"Removed temporary image folder: {temp_images_folder}")
@@ -203,10 +212,6 @@ def process_large_pdf(pdf_path, temp_images_folder):
     return full_extracted_text
 
 def harmonize_document(extracted_text):
-    """
-    Cleans and harmonizes text extracted in batches.
-    """
-    # --- REVISED PROMPT START ---
     prompt = f"""
     **Task: Document Harmonization for RAG System - Absolute Fidelity Required**
 
@@ -224,8 +229,6 @@ def harmonize_document(extracted_text):
     5.  **DO NOT summarize, paraphrase, interpret, add comments, or generate new information.** Your function is purely to assemble the transcribed text into a single, correct, and continuous representation of the original document.
     6.  **The output MUST be the complete, raw, merged text content, nothing more.**
     """
-    # --- REVISED PROMPT END ---
-
-    # Use the model to process the harmonization prompt
-    response = model.generate_content(prompt)
+    content = [prompt, extracted_text]
+    response = model.generate_content(content)
     return response.text
